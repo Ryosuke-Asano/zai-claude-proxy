@@ -1,0 +1,14 @@
+{
+  "name": "zai-claude-proxy",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Minimal proxy to use Z.AI GLM models from Claude Code / Claude Desktop",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node proxy.mjs"
+  }
+}
