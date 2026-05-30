@@ -1,10 +1,13 @@
 #!/usr/bin/env node
 //
-// zai-claude-proxy — Multi-backend proxy for Claude Desktop / Claude Code.
+// zai-claude-proxy — Minimal proxy that maps Claude model names → Z.AI GLM models.
 //
-// Routes model requests to the correct backend:
-//   • Z.AI models (claude-zhipu-*, claude-sonnet-*, claude-haiku-*) → api.z.ai
-//   • CC models   (claude-xiaomi-*, claude-opus-4-7)               → CC Proxy (:3334)
+// All models are routed to Z.AI's Anthropic-compatible endpoint:
+//   https://api.z.ai/api/anthropic
+// The proxy only needs to:
+//   1. Replace the model name in the request body  (claude-* → GLM-*)
+//   2. Replace the model name in the response      (GLM-* → claude-*)
+//   3. Forward everything else transparently
 //
 // Usage:
 //   node proxy.mjs
@@ -31,39 +34,39 @@ const PORT = process.env.ZAI_PROXY_PORT || 3333;
 const ZAI_BASE = (
   process.env.ZAI_API_URL || "https://api.z.ai/api/anthropic"
 ).replace(/\/$/, "");
-const CC_PROXY = (
-  process.env.CC_PROXY_URL || "http://localhost:3334/anthropic"
-).replace(/\/$/, "");
 
 /**
- * Model routing table.
- * Each entry: { backend: "zai" | "cc", target: "<upstream model>" }
+ * Claude model → Z.AI GLM model mapping.
  *
- * "zai" → Z.AI Anthropic endpoint  (model name replaced in both directions)
- * "cc"  → CC Proxy (:3334)         (forwarded as-is; CC Proxy handles mapping)
+ * Edit this table to add / change mappings.
+ * Unmapped model names are passed through as-is.
  */
-const MODEL_ROUTES = {
-  // --- Z.AI GLM models ---
-  "claude-opus-4-8":          { backend: "zai", target: "GLM-5.1" },
-  "claude-opus-4-5-20251101": { backend: "zai", target: "GLM-5.1" },
-  "claude-sonnet-4-7":        { backend: "zai", target: "GLM-5-turbo" },
-  "claude-sonnet-4-6":        { backend: "zai", target: "GLM-5v-turbo" },
-  "claude-sonnet-4-5-20250929": { backend: "zai", target: "GLM-4.7" },
-  "claude-haiku-4-5-20251001":  { backend: "zai", target: "GLM-4.6v" },
+const MODEL_MAP = {
+  // Opus tier
+  "claude-opus-4-8":          "GLM-5.1",
+  "claude-opus-4-7":          "GLM-5.1",
+  "claude-opus-4-6":          "GLM-5.1",
+  "claude-opus-4-5-20251101": "GLM-5.1",
 
-  // --- Z.AI GLM models (Claude Desktop custom names) ---
-  "claude-zhipu-5":  { backend: "zai", target: "GLM-5" },
-  "claude-zhipu-51": { backend: "zai", target: "GLM-5.1" },
+  // Sonnet tier
+  "claude-sonnet-4-7":        "GLM-5-turbo",
+  "claude-sonnet-4-6":        "GLM-5v-turbo",
+  "claude-sonnet-4-5-20250929": "GLM-4.7",
 
-  // --- CC Proxy models (xiaomi, deepseek, etc.) ---
-  "claude-opus-4-7":       { backend: "cc", target: "claude-opus-4-7" },
-  "claude-opus-4-6":       { backend: "cc", target: "claude-opus-4-6" },
-  "claude-xiaomi-v25-pro": { backend: "cc", target: "claude-xiaomi-v25-pro" },
-  "claude-xiaomi-v25":     { backend: "cc", target: "claude-xiaomi-v25" },
+  // Haiku tier
+  "claude-haiku-4-5-20251001": "GLM-4.6v",
+
+  // Claude Desktop custom names
+  "claude-zhipu-5":  "GLM-5",
+  "claude-zhipu-51": "GLM-5.1",
+
+  // Xiaomi aliases (mapped to closest Z.AI GLM)
+  "claude-xiaomi-v25-pro": "GLM-5.1",
+  "claude-xiaomi-v25":     "GLM-5.1",
 };
 
-function route(model) {
-  return MODEL_ROUTES[model] || { backend: "zai", target: model };
+function resolveModel(name) {
+  return MODEL_MAP[name] || name;
 }
 
 // ---------------------------------------------------------------------------
@@ -90,62 +93,51 @@ function readBody(req) {
   });
 }
 
-/** Normalize path: accept both /anthropic/v1/... and /v1/... */
+/** Strip /anthropic prefix — ZAI_BASE already includes /api/anthropic */
 function normalizePath(raw) {
   return raw.replace(/^\/anthropic/, "") || raw;
 }
 
 // ---------------------------------------------------------------------------
-// Forward to CC Proxy (HTTP passthrough)
+// Proxy core
 // ---------------------------------------------------------------------------
 
-function forwardCC(payload, headers, path, res) {
-  const target = CC_PROXY + path;
+function proxyMessages(rawBody, reqHeaders, rawPath, res) {
+  let parsed;
+  try {
+    parsed = JSON.parse(rawBody);
+  } catch (e) {
+    res.writeHead(400, { "Content-Type": "application/json" });
+    res.end(
+      JSON.stringify({
+        type: "error",
+        error: { type: "invalid_request_error", message: e.message },
+      }),
+    );
+    return;
+  }
 
-  const req = http.request(
-    target,
-    { method: "POST", headers },
-    (upRes) => {
-      // CC Proxy returns Anthropic-format responses — just pipe through
-      res.writeHead(upRes.statusCode, upRes.headers);
-      upRes.pipe(res);
-    },
+  const origModel = parsed.model || "claude-sonnet-4-6";
+  const mapped = resolveModel(origModel);
+  parsed.model = mapped;
+
+  const payload = JSON.stringify(parsed);
+  const path = normalizePath(rawPath);
+  const target = ZAI_BASE + path;
+
+  const fwd = { ...reqHeaders };
+  delete fwd.host;
+  fwd["content-length"] = Buffer.byteLength(payload);
+
+  const isStream = parsed.stream !== false;
+  console.log(
+    `[PROXY] ${origModel} → ${mapped}  |  stream=${isStream}  |  messages=${parsed.messages?.length || 0}`,
   );
 
-  req.on("error", (e) => {
-    console.error(`[CC ERROR] ${e.message}`);
-    if (!res.headersSent) {
-      res.writeHead(502, { "Content-Type": "application/json" });
-      res.end(
-        JSON.stringify({
-          type: "error",
-          error: {
-            type: "api_error",
-            message: `CC Proxy (${CC_PROXY}) unreachable: ${e.message}`,
-          },
-        }),
-      );
-    }
-  });
-
-  req.write(payload);
-  req.end();
-}
-
-// ---------------------------------------------------------------------------
-// Forward to Z.AI (HTTPS with model-name replacement)
-// ---------------------------------------------------------------------------
-
-function forwardZAI(payload, headers, rawPath, res, origModel, target, isStream) {
-  // Strip /anthropic prefix — ZAI_BASE already includes /api/anthropic
-  const zaiPath = normalizePath(rawPath);
-  const url = ZAI_BASE + zaiPath;
-
   const upstream = https.request(
-    url,
-    { method: "POST", headers },
+    target,
+    { method: "POST", headers: fwd },
     (upRes) => {
-      // Error: pass through
       if (upRes.statusCode >= 400) {
         res.writeHead(upRes.statusCode, upRes.headers);
         upRes.pipe(res);
@@ -153,7 +145,6 @@ function forwardZAI(payload, headers, rawPath, res, origModel, target, isStream)
       }
 
       if (!isStream) {
-        // Non-streaming: buffer, replace model, return
         let buf = "";
         upRes.on("data", (c) => (buf += c));
         upRes.on("end", () => {
@@ -177,12 +168,12 @@ function forwardZAI(payload, headers, rawPath, res, origModel, target, isStream)
         Connection: "keep-alive",
       });
 
-      if (target === origModel) {
+      if (mapped === origModel) {
         upRes.pipe(res);
         return;
       }
 
-      const re = modelRegex(target);
+      const re = modelRegex(mapped);
       let leftover = "";
 
       upRes.on("data", (chunk) => {
@@ -204,7 +195,7 @@ function forwardZAI(payload, headers, rawPath, res, origModel, target, isStream)
   );
 
   upstream.on("error", (e) => {
-    console.error(`[ZAI ERROR] ${e.message}`);
+    console.error(`[ERROR] ${e.message}`);
     if (!res.headersSent) {
       res.writeHead(502, { "Content-Type": "application/json" });
       res.end(
@@ -218,46 +209,6 @@ function forwardZAI(payload, headers, rawPath, res, origModel, target, isStream)
 
   upstream.write(payload);
   upstream.end();
-}
-
-// ---------------------------------------------------------------------------
-// Proxy core
-// ---------------------------------------------------------------------------
-
-function proxyMessages(rawBody, reqHeaders, path, res) {
-  let parsed;
-  try {
-    parsed = JSON.parse(rawBody);
-  } catch (e) {
-    res.writeHead(400, { "Content-Type": "application/json" });
-    res.end(
-      JSON.stringify({
-        type: "error",
-        error: { type: "invalid_request_error", message: e.message },
-      }),
-    );
-    return;
-  }
-
-  const origModel = parsed.model || "claude-sonnet-4-6";
-  const { backend, target } = route(origModel);
-  parsed.model = target;
-
-  const payload = JSON.stringify(parsed);
-  const fwd = { ...reqHeaders };
-  delete fwd.host;
-  fwd["content-length"] = Buffer.byteLength(payload);
-
-  const isStream = parsed.stream !== false;
-  console.log(
-    `[PROXY] ${origModel} → ${target}  |  ${backend.toUpperCase()}  |  stream=${isStream}  |  messages=${parsed.messages?.length || 0}`,
-  );
-
-  if (backend === "cc") {
-    forwardCC(payload, fwd, path, res);
-  } else {
-    forwardZAI(payload, fwd, path, res, origModel, target, isStream);
-  }
 }
 
 // ---------------------------------------------------------------------------
@@ -281,12 +232,12 @@ const server = http.createServer(async (req, res) => {
 
   if (req.method === "GET" && path === "/health") {
     res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ status: "ok", zai: ZAI_BASE, cc: CC_PROXY }));
+    res.end(JSON.stringify({ status: "ok", upstream: ZAI_BASE }));
     return;
   }
 
   if (req.method === "GET" && MODEL_PATHS.has(path)) {
-    const data = Object.keys(MODEL_ROUTES).map((id) => ({
+    const data = Object.keys(MODEL_MAP).map((id) => ({
       id,
       display_name: id,
       created_at: new Date().toISOString(),
@@ -313,14 +264,12 @@ const server = http.createServer(async (req, res) => {
 // ---------------------------------------------------------------------------
 
 server.listen(PORT, () => {
-  console.log(`\n  Z.AI Claude Proxy v0.2.0`);
+  console.log(`\n  Z.AI Claude Proxy v0.3.0`);
   console.log(`  Listening: http://localhost:${PORT}`);
-  console.log(`  Z.AI:      ${ZAI_BASE}`);
-  console.log(`  CC Proxy:  ${CC_PROXY}`);
-  console.log(`\n  Model routing:`);
-  for (const [k, v] of Object.entries(MODEL_ROUTES)) {
-    const tag = v.backend === "cc" ? "CC " : "ZAI";
-    console.log(`    ${k.padEnd(32)} → ${v.target.padEnd(20)} [${tag}]`);
+  console.log(`  Upstream:  ${ZAI_BASE}`);
+  console.log(`\n  Model mapping:`);
+  for (const [k, v] of Object.entries(MODEL_MAP)) {
+    console.log(`    ${k.padEnd(32)} → ${v}`);
   }
   console.log(`\n  Claude Desktop:`);
   console.log(`    inferenceGatewayBaseUrl: http://localhost:${PORT}/anthropic/`);
