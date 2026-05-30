@@ -52,7 +52,7 @@ const MODEL_MAP = {
   "claude-sonnet-4-5-20250929": "GLM-4.7",
 
   // Haiku tier
-  "claude-haiku-4-5-20251001": "GLM-4.5-Air",
+  "claude-haiku-4-5-20251001": "GLM-4.6v",
 };
 
 function resolveModel(name) {
